@@ -59,13 +59,13 @@ void BufferCache::InvalidateMemory(VAddr device_addr, u64 size) {
         return;
     }
     // Mark the page as CPU modified to stop tracking writes.
-    SCOPE_EXIT {
-        memory_tracker.MarkRegionAsCpuModified(device_addr, size);
-    };
-    if (!memory_tracker.IsRegionGpuModified(device_addr, size)) {
-        // Page has not been modified by the GPU, nothing to do.
-        return;
+    const u64 page = device_addr >> CACHING_PAGEBITS;
+    const BufferId buffer_id = page_table[page];
+    if (!buffer_id) {
+      return;
     }
+    const Buffer& buffer = slot_buffers[buffer_id];
+    memory_tracker.MarkRegionAsCpuModified(buffer.cpu_addr, buffer.size_bytes);
 }
 
 void BufferCache::DownloadBufferMemory(Buffer& buffer, VAddr device_addr, u64 size) {
