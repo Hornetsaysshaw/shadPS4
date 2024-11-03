@@ -62,7 +62,7 @@ void BufferCache::InvalidateMemory(VAddr device_addr, u64 size) {
     const u64 page = device_addr >> CACHING_PAGEBITS;
     const BufferId buffer_id = page_table[page];
     if (!buffer_id) {
-      return;
+        return;
     }
     const Buffer& buffer = slot_buffers[buffer_id];
     memory_tracker.MarkRegionAsCpuModified(buffer.cpu_addr, buffer.size_bytes);
