@@ -5,18 +5,12 @@
 
 #include "common/enum.h"
 #include "common/types.h"
+#include "core/libraries/ajm/ajm.h"
+#include "core/libraries/ajm/ajm_batch.h"
 
-#include <boost/container/small_vector.hpp>
-
+#include <memory>
 #include <optional>
-#include <span>
-#include <vector>
-
-extern "C" {
-struct AVCodec;
-struct AVCodecContext;
-struct AVCodecParserContext;
-}
+#include <tuple>
 
 namespace Libraries::Ajm {
 
@@ -33,122 +27,82 @@ constexpr int ORBIS_AJM_RESULT_PRIORITY_PASSED = 0x00000200;
 constexpr int ORBIS_AJM_RESULT_CODEC_ERROR = 0x40000000;
 constexpr int ORBIS_AJM_RESULT_FATAL = 0x80000000;
 
-constexpr u32 ORBIS_AT9_CONFIG_DATA_SIZE = 4;
+class SparseOutputBuffer {
+public:
+    SparseOutputBuffer(std::span<std::span<u8>> chunks)
+        : m_chunks(chunks), m_current(m_chunks.begin()) {}
 
-enum class AjmCodecType : u32 {
-    Mp3Dec = 0,
-    At9Dec = 1,
-    M4aacDec = 2,
-    Max = 23,
-};
-DECLARE_ENUM_FLAG_OPERATORS(AjmCodecType);
-static constexpr u32 NumAjmCodecs = u32(AjmCodecType::Max);
+    template <class T>
+    size_t Write(std::span<T> pcm) {
+        size_t bytes_written = 0;
+        while (!pcm.empty() && !IsEmpty()) {
+            auto size = std::min(pcm.size() * sizeof(T), m_current->size());
+            std::memcpy(m_current->data(), pcm.data(), size);
+            bytes_written += size;
+            pcm = pcm.subspan(size / sizeof(T));
+            *m_current = m_current->subspan(size);
+            if (m_current->empty()) {
+                ++m_current;
+            }
+        }
+        return bytes_written;
+    }
 
-enum class AjmFormatEncoding : u32 {
-    S16 = 0,
-    S32 = 1,
-    Float = 2,
-};
+    bool IsEmpty() {
+        return m_current == m_chunks.end();
+    }
 
-struct AjmSidebandResult {
-    s32 result;
-    s32 internal_result;
-};
+    size_t Size() {
+        size_t result = 0;
+        for (auto it = m_current; it != m_chunks.end(); ++it) {
+            result += it->size();
+        }
+        return result;
+    }
 
-struct AjmSidebandMFrame {
-    u32 num_frames;
-    u32 reserved;
-};
-
-struct AjmSidebandStream {
-    s32 input_consumed;
-    s32 output_written;
-    u64 total_decoded_samples;
-};
-
-struct AjmSidebandFormat {
-    u32 num_channels;
-    u32 channel_mask;
-    u32 sampl_freq;
-    AjmFormatEncoding sample_encoding;
-    u32 bitrate;
-    u32 reserved;
+private:
+    std::span<std::span<u8>> m_chunks;
+    std::span<std::span<u8>>::iterator m_current;
 };
 
-struct AjmSidebandGaplessDecode {
-    u32 total_samples;
-    u16 skip_samples;
-    u16 skipped_samples;
+struct DecodeResult {
+    u32 bytes_consumed{};
+    u32 bytes_written{};
 };
 
-struct AjmSidebandResampleParameters {
-    float ratio;
-    uint32_t flags;
-};
-
-struct AjmDecAt9InitializeParameters {
-    u8 config_data[ORBIS_AT9_CONFIG_DATA_SIZE];
-    u32 reserved;
-};
-
-union AjmSidebandInitParameters {
-    AjmDecAt9InitializeParameters at9;
-    u8 reserved[8];
-};
-
-struct AjmJobInput {
-    std::optional<AjmDecAt9InitializeParameters> init_params;
-    std::optional<AjmSidebandResampleParameters> resample_parameters;
-    std::optional<AjmSidebandFormat> format;
-    std::optional<AjmSidebandGaplessDecode> gapless_decode;
-    std::vector<u8> buffer;
-};
-
-struct AjmJobOutput {
-    boost::container::small_vector<std::span<u8>, 4> buffers;
-    AjmSidebandResult* p_result = nullptr;
-    AjmSidebandStream* p_stream = nullptr;
-    AjmSidebandFormat* p_format = nullptr;
-    AjmSidebandGaplessDecode* p_gapless_decode = nullptr;
-    AjmSidebandMFrame* p_mframe = nullptr;
-    u8* p_codec_info = nullptr;
-};
-
-union AjmInstanceFlags {
-    u64 raw;
-    struct {
-        u64 version : 3;
-        u64 channels : 4;
-        u64 format : 3;
-        u64 gapless_loop : 1;
-        u64 pad : 21;
-        u64 codec : 28;
-    };
-};
-
-struct AjmInstance {
-    AjmCodecType codec_type;
-    AjmFormatEncoding fmt{};
-    AjmInstanceFlags flags{.raw = 0};
-    u32 num_channels{};
-    u32 index{};
-    u32 gapless_decoded_samples{};
-    u32 total_decoded_samples{};
-    AjmSidebandFormat format{};
-    AjmSidebandGaplessDecode gapless{};
-    AjmSidebandResampleParameters resample_parameters{};
-
-    explicit AjmInstance() = default;
-    virtual ~AjmInstance() = default;
-
-    virtual void Reset() = 0;
+class AjmCodec {
+public:
+    virtual ~AjmCodec() = default;
 
     virtual void Initialize(const void* buffer, u32 buffer_size) = 0;
+    virtual void Reset() = 0;
+    virtual void GetInfo(void* out_info) = 0;
+    virtual std::tuple<u32, u32> ProcessData(std::span<u8>& input, SparseOutputBuffer& output,
+                                             AjmSidebandGaplessDecode& gapless,
+                                             u32 max_samples) = 0;
+};
 
-    virtual void GetCodecInfo(void* out_info) = 0;
-    virtual u32 GetCodecInfoSize() = 0;
+class AjmInstance {
+public:
+    AjmInstance(AjmCodecType codec_type, AjmInstanceFlags flags);
 
-    virtual void Decode(const AjmJobInput* input, AjmJobOutput* output) = 0;
+    void ExecuteJob(AjmJob& job);
+
+private:
+    bool IsGaplessEnd();
+
+    AjmInstanceFlags m_flags{};
+    AjmSidebandFormat m_format{};
+    AjmSidebandGaplessDecode m_gapless{};
+    AjmSidebandResampleParameters m_resample_parameters{};
+
+    u32 m_gapless_samples{};
+    u32 m_total_samples{};
+
+    std::unique_ptr<AjmCodec> m_codec;
+
+    // AjmCodecType codec_type;
+    // u32 index{};
 };
 
 } // namespace Libraries::Ajm

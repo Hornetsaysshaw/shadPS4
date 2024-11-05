@@ -2,7 +2,9 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "common/assert.h"
+#include "core/libraries/ajm/ajm_error.h"
 #include "core/libraries/ajm/ajm_mp3.h"
+#include "core/libraries/error_codes.h"
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -52,138 +54,99 @@ AVFrame* ConvertAudioFrame(AVFrame* frame) {
 }
 
 AjmMp3Decoder::AjmMp3Decoder() {
-    codec = avcodec_find_decoder(AV_CODEC_ID_MP3);
-    ASSERT_MSG(codec, "MP3 codec not found");
-    parser = av_parser_init(codec->id);
-    ASSERT_MSG(parser, "Parser not found");
+    m_codec = avcodec_find_decoder(AV_CODEC_ID_MP3);
+    ASSERT_MSG(m_codec, "MP3 m_codec not found");
+    m_parser = av_parser_init(m_codec->id);
+    ASSERT_MSG(m_parser, "Parser not found");
     AjmMp3Decoder::Reset();
 }
 
 AjmMp3Decoder::~AjmMp3Decoder() {
-    avcodec_free_context(&c);
-    av_free(c);
+    avcodec_free_context(&m_codec_context);
 }
 
 void AjmMp3Decoder::Reset() {
-    if (c) {
-        avcodec_free_context(&c);
-        av_free(c);
+    if (m_codec_context) {
+        avcodec_free_context(&m_codec_context);
     }
-    c = avcodec_alloc_context3(codec);
-    ASSERT_MSG(c, "Could not allocate audio codec context");
-    int ret = avcodec_open2(c, codec, nullptr);
-    ASSERT_MSG(ret >= 0, "Could not open codec");
-    total_decoded_samples = 0;
-    gapless_decoded_samples = 0;
+    m_codec_context = avcodec_alloc_context3(m_codec);
+    ASSERT_MSG(m_codec_context, "Could not allocate audio m_codec context");
+    int ret = avcodec_open2(m_codec_context, m_codec, nullptr);
+    ASSERT_MSG(ret >= 0, "Could not open m_codec");
 }
 
-void AjmMp3Decoder::Decode(const AjmJobInput* input, AjmJobOutput* output) {
+void AjmMp3Decoder::GetInfo(void* out_info) {
+    auto* info = reinterpret_cast<AjmSidebandDecMp3CodecInfo*>(out_info);
+}
+
+std::tuple<u32, u32> AjmMp3Decoder::ProcessData(std::span<u8>& in_buf, SparseOutputBuffer& output,
+                                                AjmSidebandGaplessDecode& gapless,
+                                                u32 max_samples) {
     AVPacket* pkt = av_packet_alloc();
 
-    size_t out_buffer_index = 0;
-    std::span<const u8> in_buf(input->buffer);
-    std::span<u8> out_buf = output->buffers[out_buffer_index];
-    const auto should_decode = [&] {
-        if (in_buf.empty() || out_buf.empty()) {
-            return false;
-        }
-        if (gapless.total_samples != 0 && gapless.total_samples < gapless_decoded_samples) {
-            return false;
-        }
-        return true;
-    };
+    int ret = av_parser_parse2(m_parser, m_codec_context, &pkt->data, &pkt->size, in_buf.data(),
+                               in_buf.size(), AV_NOPTS_VALUE, AV_NOPTS_VALUE, 0);
+    ASSERT_MSG(ret >= 0, "Error while parsing {}", ret);
+    in_buf = in_buf.subspan(ret);
 
-    const auto write_output = [&](std::span<s16> pcm) {
-        while (!pcm.empty()) {
-            auto size = std::min(pcm.size() * sizeof(u16), out_buf.size());
-            std::memcpy(out_buf.data(), pcm.data(), size);
-            pcm = pcm.subspan(size >> 1);
-            out_buf = out_buf.subspan(size);
-            if (out_buf.empty()) {
-                out_buffer_index += 1;
-                if (out_buffer_index >= output->buffers.size()) {
-                    return pcm.empty();
-                }
-                out_buf = output->buffers[out_buffer_index];
+    u32 frames_decoded = 0;
+    u32 samples_decoded = 0;
+
+    if (pkt->size) {
+        // Send the packet with the compressed data to the decoder
+        pkt->pts = m_parser->pts;
+        pkt->dts = m_parser->dts;
+        pkt->flags = (m_parser->key_frame == 1) ? AV_PKT_FLAG_KEY : 0;
+        ret = avcodec_send_packet(m_codec_context, pkt);
+        ASSERT_MSG(ret >= 0, "Error submitting the packet to the decoder {}", ret);
+
+        // Read all the output frames (in general there may be any number of them
+        while (ret >= 0) {
+            AVFrame* frame = av_frame_alloc();
+            ret = avcodec_receive_frame(m_codec_context, frame);
+            if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
+                break;
+            } else if (ret < 0) {
+                UNREACHABLE_MSG("Error during decoding");
             }
-        }
-        return true;
-    };
-
-    while (should_decode()) {
-        int ret = av_parser_parse2(parser, c, &pkt->data, &pkt->size, in_buf.data(), in_buf.size(),
-                                   AV_NOPTS_VALUE, AV_NOPTS_VALUE, 0);
-        ASSERT_MSG(ret >= 0, "Error while parsing {}", ret);
-        in_buf = in_buf.subspan(ret);
-
-        if (output->p_stream) {
-            output->p_stream->input_consumed += ret;
-        }
-        if (pkt->size) {
-            // Send the packet with the compressed data to the decoder
-            pkt->pts = parser->pts;
-            pkt->dts = parser->dts;
-            pkt->flags = (parser->key_frame == 1) ? AV_PKT_FLAG_KEY : 0;
-            ret = avcodec_send_packet(c, pkt);
-            ASSERT_MSG(ret >= 0, "Error submitting the packet to the decoder {}", ret);
-
-            // Read all the output frames (in general there may be any number of them
-            while (ret >= 0) {
-                AVFrame* frame = av_frame_alloc();
-                ret = avcodec_receive_frame(c, frame);
-                if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
-                    break;
-                } else if (ret < 0) {
-                    UNREACHABLE_MSG("Error during decoding");
-                }
-                if (frame->format != AV_SAMPLE_FMT_S16) {
-                    frame = ConvertAudioFrame(frame);
-                }
-                const auto size = frame->ch_layout.nb_channels * frame->nb_samples * sizeof(u16);
-                if (gapless.skipped_samples < gapless.skip_samples) {
-                    gapless.skipped_samples += frame->nb_samples;
-                    if (gapless.skipped_samples > gapless.skip_samples) {
-                        const u32 nsamples = gapless.skipped_samples - gapless.skip_samples;
-                        const auto start = frame->nb_samples - nsamples;
-                        write_output({reinterpret_cast<s16*>(frame->data[0]),
-                                      nsamples * frame->ch_layout.nb_channels});
-                        gapless.skipped_samples = gapless.skip_samples;
-                        total_decoded_samples += nsamples;
-                        if (gapless.total_samples != 0) {
-                            gapless_decoded_samples += nsamples;
-                        }
-                    }
-                } else {
-                    write_output({reinterpret_cast<s16*>(frame->data[0]), size >> 1});
-                    total_decoded_samples += frame->nb_samples;
-                    if (gapless.total_samples != 0) {
-                        gapless_decoded_samples += frame->nb_samples;
-                    }
-                }
-                av_frame_free(&frame);
-                if (output->p_stream) {
-                    output->p_stream->output_written += size;
-                }
-                if (output->p_mframe) {
-                    output->p_mframe->num_frames += 1;
-                }
+            if (frame->format != AV_SAMPLE_FMT_S16) {
+                frame = ConvertAudioFrame(frame);
             }
+
+            frames_decoded += 1;
+            samples_decoded += frame->nb_samples;
+            const auto size = frame->ch_layout.nb_channels * frame->nb_samples * sizeof(u16);
+            std::span<s16> pcm_data(reinterpret_cast<s16*>(frame->data[0]), size >> 1);
+            if (gapless.skipped_samples < gapless.skip_samples) {
+                const auto skipped_samples = std::min(
+                    u32(frame->nb_samples), u32(gapless.skip_samples - gapless.skipped_samples));
+                gapless.skipped_samples += skipped_samples;
+                pcm_data = pcm_data.subspan(skipped_samples * frame->ch_layout.nb_channels);
+                samples_decoded -= skipped_samples;
+            }
+
+            const auto pcm_size = std::min(u32(pcm_data.size()), max_samples);
+            output.Write(pcm_data.subspan(0, pcm_size));
+
+            av_frame_free(&frame);
         }
     }
+
     av_packet_free(&pkt);
-    if (gapless.total_samples != 0 && gapless_decoded_samples >= gapless.total_samples) {
-        if (flags.gapless_loop) {
-            gapless.skipped_samples = 0;
-            gapless_decoded_samples = 0;
-        }
-    }
-    if (output->p_stream) {
-        output->p_stream->total_decoded_samples = total_decoded_samples;
-    }
+
+    return {frames_decoded, samples_decoded};
 }
 
 int AjmMp3Decoder::ParseMp3Header(const u8* buf, u32 stream_size, int parse_ofl,
                                   AjmDecMp3ParseFrame* frame) {
+    LOG_INFO(Lib_Ajm, "called stream_size = {} parse_ofl = {}", stream_size, parse_ofl);
+    if (buf == nullptr || stream_size < 4 || frame == nullptr) {
+        return ORBIS_AJM_ERROR_INVALID_PARAMETER;
+    }
+    if ((buf[0] & SYNCWORDH) != SYNCWORDH || (buf[1] & SYNCWORDL) != SYNCWORDL) {
+        return ORBIS_AJM_ERROR_INVALID_PARAMETER;
+    }
+
     const u32 unk_idx = buf[1] >> 3 & 1;
     const s32 version_idx = (buf[1] >> 3 & 3) ^ 2;
     const s32 sr_idx = buf[2] >> 2 & 3;
@@ -196,11 +159,8 @@ int AjmMp3Decoder::ParseMp3Header(const u8* buf, u32 stream_size, int parse_ofl,
     frame->frame_size = (UnkTable[unk_idx] * frame->bitrate) / frame->sample_rate + padding_bit;
     frame->samples_per_channel = UnkTable[unk_idx] * 8;
     frame->encoder_delay = 0;
-    if (parse_ofl == 0) {
-        return 0;
-    }
 
-    return 0;
+    return ORBIS_OK;
 }
 
 } // namespace Libraries::Ajm
